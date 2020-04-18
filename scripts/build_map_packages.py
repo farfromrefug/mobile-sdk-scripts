@@ -1,20 +1,18 @@
 # Script for extracting vector tiles (from OMT planet database) into .mbtiles sqlite
 # databases.
 
-import sys
 import io
 import os
+import sys
 import json
 import gzip
 import zlib
 import base64
 import sqlite3
 import argparse
-import pyproj
 import concurrent.futures
-import utils.tilemask as utils_tilemask
-import utils.mbvtpackage_pb2 as mbvtpackage_pb2
 from contextlib import closing
+import utils.mbvtpackage_pb2 as mbvtpackage_pb2
 
 # Package URL template
 DEFAULT_PACKAGE_URL_TEMPLATE = 'FULL_PACKAGE_URL/{version}/{id}.mbtiles?appToken={{key}}'
@@ -24,8 +22,6 @@ DEFAULT_PACKAGE_VERSION = 1
 
 # Maximum zoom level used in offline packages
 MAX_ZOOMLEVEL = 14
-epsg3857 = pyproj.Proj(init='epsg:3857')
-wgs84 = pyproj.Proj(init='epsg:4326')
 
 class PackageTileMask(object):
   def __init__(self, tileMaskStr):
@@ -273,18 +269,7 @@ def loadZDict(packageId, zdictDir):
   print('Warning: Could not find dictionary for package %s!' % packageId)
   return None
 
-def extractTiles(package, packageId, tileMask, worldFileName, outputFileName, maxZoom=14, zdict=None):
-
-  
-  bounds = utils_tilemask.tileMaskPolygon(package['tile_mask']).bounds
-  clipPos0 = pyproj.transform(epsg3857, wgs84, bounds[0], bounds[1])
-  clipPos1 = pyproj.transform(epsg3857, wgs84, bounds[2], bounds[3])
-  clipBounds = [clipPos0[0], clipPos0[1], clipPos1[0], clipPos1[1]]
-  boundsCenter = [clipPos0[0]  + (clipPos1[0] - clipPos0[0]) / 2, clipPos0[1] + (clipPos1[1] - clipPos0[1]) / 2, 11]
-  print('extractTiles %s' % packageId)
-  print('bounds %s'  % clipBounds)
-  print('boundsCenter %s'  % boundsCenter)
-
+def extractTiles(packageId, tileMask, worldFileName, outputFileName, maxZoom=14, zdict=None):
   # Decode tilemask, create full list of tiles up to specified zoom level
   tiles = PackageTileMask(tileMask).getTiles(maxZoom)
   tiles.reverse() # reverse tiles, for more optimal hit
@@ -292,48 +277,28 @@ def extractTiles(package, packageId, tileMask, worldFileName, outputFileName, ma
   # Open input file
   with closing(sqlite3.connect('file:%s?mode=ro' % worldFileName, uri=True)) as packageDb:
     packageCursor = packageDb.cursor()
+    
     # Open output file and prepare database
     if os.path.exists(outputFileName):
       os.remove(outputFileName)
+
     with closing(sqlite3.connect(outputFileName)) as outputDb:
+      outputDb.execute("PRAGMA locking_mode=EXCLUSIVE")
+      outputDb.execute("PRAGMA synchronous=OFF")
+      outputDb.execute("PRAGMA page_size=512")
+      outputDb.execute("PRAGMA encoding='UTF-8'")
 
       outputCursor = outputDb.cursor()
-      outputCursor.execute("PRAGMA synchronous=OFF")
-      outputCursor.execute("PRAGMA page_size=512")
       outputCursor.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
       outputCursor.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
       outputCursor.execute("INSERT INTO metadata(name, value) VALUES('name', ?)", (packageId,))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('bounds', ?)", (','.join(map(str, clipBounds)),))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('center', ?)", (','.join(map(str, boundsCenter)),))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('minzoom', 0)")
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('maxzoom', ?)", (MAX_ZOOMLEVEL,))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('basename', ?)", (outputFileName,))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('id', ?)", (packageId,))
       outputCursor.execute("INSERT INTO metadata(name, value) VALUES('type', 'baselayer')")
       outputCursor.execute("INSERT INTO metadata(name, value) VALUES('version', '1.0')")
       outputCursor.execute("INSERT INTO metadata(name, value) VALUES('description', 'Nutiteq map package for ' || ?)", (packageId,))
-      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('format', 'pbf')")
+      outputCursor.execute("INSERT INTO metadata(name, value) VALUES('format', 'mbvt')")
       outputCursor.execute("INSERT INTO metadata(name, value) VALUES('schema', 'carto.streets')")
       if zdict is not None:
         outputCursor.execute("INSERT INTO metadata(name, value) VALUES('shared_zlib_dict', ?)", (bytes(zdict),))
-
-        # Copy pixel_scale info
-      packageCursor.execute("SELECT value FROM metadata WHERE name='pixel_scale'")
-      row = packageCursor.fetchone()
-      if row:
-        outputCursor.execute("INSERT INTO metadata(name, value) VALUES('pixel_scale', ?)", (row[0],))
-
-        # Copy attribution info
-      packageCursor.execute("SELECT value FROM metadata WHERE name='attribution'")
-      row = packageCursor.fetchone()
-      if row:
-        outputCursor.execute("INSERT INTO metadata(name, value) VALUES('attribution', ?)", (row[0],))
-
-        # Copy json info
-      packageCursor.execute("SELECT value FROM metadata WHERE name='json'")
-      row = packageCursor.fetchone()
-      if row:
-        outputCursor.execute("INSERT INTO metadata(name, value) VALUES('json', ?)", (row[0],))
 
       # Copy encryption info (we assume all packages share this)
       packageCursor.execute("SELECT value FROM metadata WHERE name='nutikeysha1'")
@@ -367,14 +332,19 @@ def extractTiles(package, packageId, tileMask, worldFileName, outputFileName, ma
 
       # Close output file
       outputCursor.execute("CREATE UNIQUE INDEX tiles_index ON tiles (zoom_level, tile_column, tile_row)");
-      # outputCursor.execute("VACUUM")
+      outputCursor.close()
       outputDb.commit()
+
+  # Vacuum the database
+  with closing(sqlite3.connect(outputFileName)) as outputDb:
+    outputDb.execute("VACUUM")
 
 def optimizeTiles(outputFileName):
   # Drop tiles that are not needed
   with closing(sqlite3.connect(outputFileName)) as outputDb:
-    outputDb.cursor().execute("PRAGMA synchronous=OFF")
-    outputDb.cursor().execute("CREATE UNIQUE INDEX IF NOT EXISTS tiles_index ON tiles (zoom_level, tile_column, tile_row)");
+    outputDb.execute("PRAGMA locking_mode=EXCLUSIVE")
+    outputDb.execute("PRAGMA synchronous=OFF")
+    outputDb.execute("CREATE UNIQUE INDEX IF NOT EXISTS tiles_index ON tiles (zoom_level, tile_column, tile_row)");
 
     # Harvest tiles
     cursor1 = outputDb.cursor()
@@ -388,25 +358,26 @@ def optimizeTiles(outputFileName):
         cursor2.execute("SELECT zoom_level FROM tiles WHERE zoom_level=?+1 AND (tile_column BETWEEN ?*2 AND ?*2+1) AND (tile_row BETWEEN ?*2 AND ?*2+1)", (zoom, x, x, y, y))
         if not cursor2.fetchone():
           cursor2.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?", (zoom, x, y))
+    cursor2.close()
+    cursor1.close()
     outputDb.commit()
 
   # Vacuum
   with closing(sqlite3.connect(outputFileName)) as outputDb:
-    outputDb.cursor().execute("VACUUM")
-    outputDb.commit()
+    outputDb.execute("VACUUM")
 
 def processPackage(package, outputDir, inputFileName, zdictDir=None):
   outputFileName = '%s/%s.mbtiles' % (outputDir, package['id'])
   if os.path.exists(outputFileName):
-    # if not os.path.exists(outputFileName + "-journal"):
-      # return outputFileName
+    if not os.path.exists(outputFileName + "-journal"):
+      return outputFileName
     os.remove(outputFileName)
-    # os.remove(outputFileName + "-journal")
+    os.remove(outputFileName + "-journal")
 
   print('Processing %s' % package['id'])
   try:
     zdict = loadZDict(package['id'], zdictDir)
-    extractTiles(package, package['id'], package['tile_mask'], inputFileName, outputFileName, MAX_ZOOMLEVEL, zdict)
+    extractTiles(package['id'], package['tile_mask'], inputFileName, outputFileName, MAX_ZOOMLEVEL, zdict)
     optimizeTiles(outputFileName)
   except:
     if os.path.isfile(outputFileName):
